@@ -1,188 +1,118 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
-
-name: Build OpenWrt
+name: Build OpenWrt 24.10.2 with Custom Kernel and Config
 
 on:
-  repository_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      ssh:
-        description: 'SSH connection to Actions'
-        required: false
-        default: 'false'
-
-env:
-  REPO_URL: https://github.com/coolsnowwolf/lede
-  REPO_BRANCH: openwrt-23.05  # 切换到23.05分支
-  FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: true
-  TZ: Asia/Shanghai
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
+    # 检出代码
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
+    # 安装依赖
+    - name: Install dependencies
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+        sudo apt-get update
+        sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
+          gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
+          file wget subversion python3 python3-pip ccache upx-ucl
 
-    - name: Clone source code
-      working-directory: /workdir
+    # 下载 OpenWrt 24.10.2 源码
+    - name: Download OpenWrt source
       run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-
-    - name: Load custom feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
+        git clone --depth 1 -b v24.10.2 https://git.openwrt.org/openwrt/openwrt.git openwrt
         cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-    - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
-
-    - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a
-
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
-
-    - name: SSH connection to Actions
-      uses: P3TERX/ssh2actions@v1.0.0
-      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
-      env:
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-
-    - name: Download package
-      id: package
+    # 更换内核到 6.12.42 并指定 commit hash
+    - name: Patch kernel to 6.12.42 with specific hash
       run: |
         cd openwrt
+        # 设置内核版本
+        sed -i 's/KERNEL_PATCHVER:=.*/KERNEL_PATCHVER:=6.12/' target/linux/generic/config-*
+        echo "KERNEL_TESTING_PATCHVER:=6.12" >> target/linux/generic/config-*
+        echo "KERNEL_GIT_HASH:=4804528a29cd20309a0b41c30e5aeffc35fa21ee3358f4a706d4586d003bc1fb" >> target/linux/generic/config-*
+        # 更新内核源码
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    # 配置软件源
+    - name: Configure custom feeds
+      run: |
+        cd openwrt
+        # 清空默认 feeds.conf.default，添加自定义软件源
+        : > feeds.conf.default
+        cat << EOF >> feeds.conf.default
+        src/gz openwrt_base https://mirrors.aliyun.com/openwrt/releases/24.10.2/packages/x86_64/base
+        src/gz openwrt_luci https://mirrors.aliyun.com/openwrt/releases/24.10.2/packages/x86_64/luci
+        src/gz openwrt_packages https://mirrors.aliyun.com/openwrt/releases/24.10.2/packages/x86_64/packages
+        src/gz openwrt_routing https://mirrors.aliyun.com/openwrt/releases/24.10.2/packages/x86_64/routing
+        src/gz openwrt_telephony https://mirrors.aliyun.com/openwrt/releases/24.10.2/packages/x86_64/telephony
+        src/gz openwrt_extras https://opkg.cooluc.com/openwrt-24.10/x86_64
+        src/gz openwrt_core https://core.cooluc.com/x86_64/6.12.41~3ce64a03a98c671d5f39ca2f49939ab2-r1
+        src-git wechatpush https://github.com/tty228/luci-app-wechatpush.git
+        EOF
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a -p wechatpush
+        ./scripts/feeds install -a
+
+    # 配置 OpenWrt
+    - name: Configure OpenWrt
+      run: |
+        cd openwrt
+        # 设置目标架构为 x86_64
+        echo "CONFIG_TARGET_x86_64=y" > .config
+        # 复制自定义 .config 文件（如果存在）
+        if [ -f "../.config" ]; then
+          cat ../.config >> .config
+        fi
+        # 修改管理 IP 为 192.168.2.2 并启用 luci-app-wechatpush
+        cat << EOF >> .config
+        CONFIG_LAN_IPADDR="192.168.2.2"
+        CONFIG_LAN_NETMASK="255.255.255.0"
+        CONFIG_PACKAGE_luci-app-wechatpush=m
+        EOF
         make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
 
-    - name: Compile the firmware
-      id: compile
+    # 编译 OpenWrt
+    - name: Build OpenWrt
       run: |
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "::set-output name=status::success"
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        make -j$(nproc) || make -j1 V=s
+      env:
+        CONFIG_CCACHE: 1
 
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
-
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+    # 上传编译结果到 Artifacts
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
       with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
+        name: openwrt-firmware
+        path: openwrt/bin/targets/*/*/*
+        retention-days: 5
 
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "::set-output name=status::success"
-
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
-
-    - name: Upload firmware to cowtransfer
-      id: cowtransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
-        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
-        echo "::set-output name=url::$(cat cowtransfer.log | grep https | cut -f3 -d" ")"
-
-    - name: Upload firmware to WeTransfer
-      id: wetransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
-        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
-        echo "::set-output name=url::$(cat wetransfer.log | grep https | cut -f3 -d" ")"
-
-    - name: Generate release tag
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "::set-output name=release_tag::$(date +"%Y.%m.%d-%H%M")"
-        touch release.txt
-        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
-        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
-        echo "::set-output name=status::success"
-
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@v1
-      if: steps.tag.outputs.status == 'success' && !cancelled()
+    # 创建 GitHub Release 并上传固件
+    - name: Create GitHub Release
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
-        
-    - name: Delete workflow runs
-      uses: GitRML/delete-workflow-runs@main
-      with:
-        retain_days: 1
-        keep_minimum_runs: 3
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.1.0
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # 获取当前时间作为 Release 标签
+        TAG_NAME="openwrt-24.10.2-$(date +%Y%m%d-%H%M%S)"
+        # 创建 Release
+        gh release create "$TAG_NAME" \
+          --title "OpenWrt 24.10.2 Build $TAG_NAME" \
+          --notes "Custom OpenWrt build with kernel 6.12.42, LAN IP 192.168.2.2, and luci-app-wechatpush" \
+          --draft=false
+        # 上传固件到 Release
+        gh release upload "$TAG_NAME" openwrt/bin/targets/*/*/* --clobber
+      working-directory: openwrt
